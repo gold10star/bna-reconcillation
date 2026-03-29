@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BNA Reconciliation</title>
+
+<style>
+body { background:#0b0f0e; color:#e6f1ec; font-family:system-ui; margin:0; }
+.container { max-width:800px; margin:auto; padding:20px; }
+.title { font-size:22px; margin-bottom:20px; }
+.card { background:#121716; border:1px solid #1f2a28; padding:15px; border-radius:8px; margin-bottom:20px; }
+input, button { width:100%; padding:10px; margin:6px 0; border-radius:6px; border:none; }
+button { background:#1ed19b; color:#000; font-weight:600; cursor:pointer; }
+.preview { max-width:120px; border-radius:6px; margin-top:10px; }
+table { width:100%; border-collapse:collapse; margin-top:10px; }
+td, th { border:1px solid #2a3a37; padding:8px; text-align:center; }
+.editable { border-bottom:1px dashed #666; }
+.warn { color:#ff5555; }
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="title">BNA Reconciliation</div>
+
+<div class="card">
+<input type="password" id="apiKey" placeholder="OpenRouter API Key (sk-or-...)">
+<input type="file" id="fileInput">
+<img id="preview" class="preview">
+<input type="number" id="locally" value="600">
+<input type="number" id="excess" placeholder="Excess ₹500">
+<button onclick="scan()">Scan</button>
+<div id="status"></div>
+</div>
+
+<div class="card" id="result"></div>
+
+</div>
+
+<script>
+
+let imageBase64="";
+
+// Load image
+document.getElementById("fileInput").onchange=e=>{
+  const file=e.target.files[0];
+  const r=new FileReader();
+  r.onload=()=>{
+    imageBase64=r.result.split(",")[1];
+    document.getElementById("preview").src=r.result;
+  };
+  r.readAsDataURL(file);
+};
+
+// 🧠 Intelligent Fix Engine
+function fix(data){
+  function correct(t){
+    if(!t) return;
+
+    let expected = t.loaded + t.deposited - t.dispensed;
+
+    if(Math.abs(expected - t.remaining)>50){
+
+      if(t.dispensed<500 && t.loaded>500){
+        t.dispensed +=1000;
+        t._fixDis=true;
+      }
+
+      if(t.remaining<500 && t.loaded>500){
+        t.remaining +=1000;
+        t._fixRem=true;
+      }
+    }
+
+    if((t.loaded + t.deposited - t.dispensed) !== t.remaining){
+      t._warn=true;
+    }
+  }
+
+  correct(data.type2);
+  correct(data.type3);
+  correct(data.type4);
+
+  return data;
+}
+
+// 🔍 Scan function
+async function scan(){
+
+  const key=document.getElementById("apiKey").value;
+
+  if(!key) return alert("Enter API key");
+  if(!imageBase64) return alert("Upload image");
+
+  document.getElementById("status").innerText="⏳ Scanning...";
+
+  const prompt=`Extract ATM cassette data.
+
+TYPE2=₹100
+TYPE3=₹500
+TYPE4=₹200
+
+Read vertically column-wise.
+Do not skip TYPE2.
+
+Return JSON:
+{
+"type2":{"loaded":0,"deposited":0,"dispensed":0,"remaining":0},
+"type3":{"loaded":0,"deposited":0,"dispensed":0,"remaining":0},
+"type4":{"loaded":0,"deposited":0,"dispensed":0,"remaining":0}
+}`;
+
+  try{
+
+    const res=await fetch("https://openrouter.ai/api/v1/chat/completions",{
+      method:"POST",
+      headers:{
+        "Authorization":"Bearer "+key,
+        "Content-Type":"application/json"
+      },
+      body:JSON.stringify({
+        model:"openai/gpt-4o-mini",
+        response_format:{type:"json_object"},
+        messages:[{
+          role:"user",
+          content:[
+            {type:"text",text:prompt},
+            {type:"image_url",image_url:`data:image/jpeg;base64,${imageBase64}`}
+          ]
+        }]
+      })
+    });
+
+    const j=await res.json();
+    console.log("API RESPONSE:", j);
+
+    let raw = j.choices?.[0]?.message?.content;
+
+    if(!raw) throw new Error("Empty AI response");
+
+    if(Array.isArray(raw)){
+      raw = raw.map(x => x.text || "").join("");
+    }
+
+    raw = raw.replace(/```json|```/g,'').trim();
+
+    let data = JSON.parse(raw);
+
+    data = fix(data);
+
+    render(data);
+
+    document.getElementById("status").innerText="✅ Done";
+
+  }catch(e){
+    console.error(e);
+    document.getElementById("status").innerText="❌ "+e.message;
+  }
+}
+
+// 📊 Render result
+function render(d){
+
+  let warn="";
+  if(d.type2._warn || d.type3._warn || d.type4._warn){
+    warn="⚠ Please verify values";
+  }
+
+  document.getElementById("result").innerHTML=`
+  ${warn?'<div class="warn">'+warn+'</div>':''}
+
+  <table>
+  <tr><th>Denom</th><th>Dep</th><th>Dis</th><th>Rem</th></tr>
+
+  ${row("₹100",d.type2)}
+  ${row("₹500",d.type3)}
+  ${row("₹200",d.type4)}
+
+  </table>
+
+  <button onclick="recalc()">Recalculate</button>
+  <div id="total"></div>
+  `;
+
+  recalc();
+}
+
+function row(label,t){
+  return `
+  <tr>
+  <td>${label}</td>
+  <td contenteditable class="editable">${t.deposited}</td>
+  <td contenteditable class="editable ${t._fixDis?'warn':''}">${t.dispensed}</td>
+  <td contenteditable class="editable ${t._fixRem?'warn':''}">${t.remaining}</td>
+  </tr>`;
+}
+
+// 🔄 Recalculate
+function recalc(){
+
+  let total=0;
+
+  document.querySelectorAll("table tr").forEach((r,i)=>{
+    if(i===0) return;
+
+    const denom=parseInt(r.children[0].innerText.replace("₹",""));
+    const rem=parseInt(r.children[3].innerText)||0;
+
+    total+=denom*rem;
+  });
+
+  document.getElementById("total").innerText="Total Remaining: ₹"+total.toLocaleString();
+}
+
+</script>
+
+</body>
+</html>
